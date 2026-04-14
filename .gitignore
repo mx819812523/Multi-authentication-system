@@ -1,0 +1,16 @@
+# Rust
+backend/target/
+
+# Node
+frontend/node_modules/
+frontend/dist/
+
+# Env files
+.env
+**/.env
+!.env.example
+
+# Build caches
+*.tsbuildinfo
+frontend/vite.config.js
+frontend/vite.config.d.ts
