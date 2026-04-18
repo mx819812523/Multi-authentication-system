@@ -1,6 +1,6 @@
 import { AnimatePresence, motion } from 'framer-motion'
 import { FormEvent, useEffect, useMemo, useState } from 'react'
-import { api, AuthResponse, SessionInfo, SubjectProfile, SubjectType } from './lib/api'
+import { api, AuthResponse, LinkedSubject, SessionInfo, SubjectProfile, SubjectType } from './lib/api'
 import { createPasskeyCredential, getPasskeyCredential } from './lib/webauthn'
 
 type Method = 'password' | 'otp' | 'passkey'
@@ -38,17 +38,16 @@ export default function App() {
   const [deviceName, setDeviceName] = useState('MacBook Pro')
 
   const [otpCode, setOtpCode] = useState('')
-  const [otpPreview, setOtpPreview] = useState('')
   const [otpHint, setOtpHint] = useState('')
 
   const [passkeyName, setPasskeyName] = useState('Primary Device')
 
   const [mfaTicket, setMfaTicket] = useState<string | null>(null)
   const [mfaOtp, setMfaOtp] = useState('')
-  const [mfaPreview, setMfaPreview] = useState('')
 
   const [token, setToken] = useState<string | null>(localStorage.getItem(STORAGE.token(subject)))
   const [profile, setProfile] = useState<SubjectProfile | null>(null)
+  const [linkedSubjects, setLinkedSubjects] = useState<LinkedSubject[]>([])
   const [sessions, setSessions] = useState<SessionInfo[]>([])
 
   const [message, setMessage] = useState<string>('')
@@ -66,21 +65,21 @@ export default function App() {
   useEffect(() => {
     if (!token) {
       setProfile(null)
+      setLinkedSubjects([])
       setSessions([])
       return
     }
 
     void refreshProfile(token)
+    void refreshLinkedSubjects(token)
     void refreshSessions(token)
   }, [token])
 
   function resetFlow() {
     setOtpCode('')
-    setOtpPreview('')
     setOtpHint('')
     setMfaTicket(null)
     setMfaOtp('')
-    setMfaPreview('')
     setMessage('')
   }
 
@@ -102,26 +101,37 @@ export default function App() {
     }
   }
 
+  async function refreshLinkedSubjects(currentToken: string) {
+    try {
+      const list = await api.linkedSubjects(currentToken)
+      setLinkedSubjects(list)
+    } catch {
+      clearLoginState()
+    }
+  }
+
   function clearLoginState() {
     localStorage.removeItem(STORAGE.token(subject))
     setToken(null)
     setProfile(null)
+    setLinkedSubjects([])
     setSessions([])
   }
 
   function applyAuthResult(result: AuthResponse) {
     if (result.status === 'mfa_required') {
       setMfaTicket(result.ticket_id)
-      setMfaPreview(result.demo_otp)
-      setMessage(`${result.otp_hint} demo OTP: ${result.demo_otp}`)
+      setMessage(result.otp_hint)
       return
     }
 
     localStorage.setItem(STORAGE.token(subject), result.token)
     setToken(result.token)
-    setProfile(result.subject)
     setSessions((prev) => [result.session, ...prev.filter((s) => s.id !== result.session.id)])
-    setMessage(`登录成功: ${result.subject.display_name}`)
+    void refreshProfile(result.token)
+    void refreshLinkedSubjects(result.token)
+    void refreshSessions(result.token)
+    setMessage(`登录成功`)
     setMfaTicket(null)
   }
 
@@ -150,8 +160,7 @@ export default function App() {
     try {
       const res = await api.otpRequest(subject, { email })
       setOtpHint(res.otp_hint)
-      setOtpPreview(res.demo_otp)
-      setMessage(`${res.otp_hint} demo OTP: ${res.demo_otp}`)
+      setMessage(res.otp_hint)
     } catch (err) {
       setMessage((err as Error).message)
     } finally {
@@ -370,7 +379,6 @@ export default function App() {
                   <button type="button" disabled={loading} onClick={onRequestOtp}>
                     Request OTP
                   </button>
-                  {otpPreview && <span className="code">{otpPreview}</span>}
                 </div>
                 <label>
                   OTP Code
@@ -422,7 +430,6 @@ export default function App() {
                 OTP
                 <input value={mfaOtp} onChange={(e) => setMfaOtp(e.target.value)} />
               </label>
-              {mfaPreview && <p className="tip">Demo MFA OTP: {mfaPreview}</p>}
               <button type="submit" disabled={loading}>
                 Verify MFA
               </button>
@@ -475,6 +482,38 @@ export default function App() {
             ))}
           </div>
         </section>
+
+        {linkedSubjects.length > 0 && (
+          <section className="lane linked-lane">
+            <div className="linked-subjects">
+              <h3>Linked Subjects</h3>
+              <div className="linked-table-wrap">
+                <table className="linked-table">
+                  <thead>
+                    <tr>
+                      <th>Subject</th>
+                      <th>Email</th>
+                      <th>Display Name</th>
+                      <th>MFA</th>
+                      <th>Status</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {linkedSubjects.map((item) => (
+                      <tr key={item.id}>
+                        <td>{item.subject_type}</td>
+                        <td>{item.email}</td>
+                        <td>{item.display_name}</td>
+                        <td>{item.mfa_enabled ? 'Enabled' : 'Disabled'}</td>
+                        <td>{item.is_current ? 'Current' : 'Linked'}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </section>
+        )}
       </main>
     </div>
   )

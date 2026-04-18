@@ -60,6 +60,8 @@ Open [http://localhost:5173](http://localhost:5173).
 - `POST /auth/:subject/passkey/login/finish`
 - `POST /auth/:subject/mfa/verify`
 - `GET /me/profile`
+- `POST /me/profile`
+- `GET /me/linked-subjects`
 - `GET /me/sessions`
 - `POST /me/sessions/revoke`
 - `POST /auth/logout`
@@ -67,6 +69,7 @@ Open [http://localhost:5173](http://localhost:5173).
 ## Notes
 
 - Passkey uses standard browser WebAuthn ceremony (`navigator.credentials.create/get`).
-- Sessions are stored server-side and can be revoked per device.
+- Sessions store only hashed token digests server-side (plaintext token is returned once at sign-in).
+- Person layer is enabled: one `person` can link multiple `subject` identities, query with `/me/linked-subjects`.
 - Same subject logging in repeatedly from the same device fingerprint will keep only the latest active session (soft dedupe).
-- OTP is returned in API response for demo visibility.
+- OTP is not returned in API responses; connect your out-of-band OTP channel in production.

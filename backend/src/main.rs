@@ -15,6 +15,7 @@ use chrono::{DateTime, Duration, Utc};
 use rand::{distributions::Alphanumeric, Rng};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use sqlx::{postgres::PgPoolOptions, FromRow, PgPool};
 use tokio::sync::RwLock;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
@@ -26,6 +27,7 @@ use webauthn_rs::prelude::*;
 struct AppState {
     pool: PgPool,
     session_ttl_hours: i64,
+    session_token_pepper: String,
     webauthn: Arc<Webauthn>,
     ceremonies: Arc<RwLock<HashMap<Uuid, CeremonyState>>>,
 }
@@ -147,6 +149,7 @@ struct HealthResponse {
 #[derive(Debug, FromRow)]
 struct SubjectRow {
     id: Uuid,
+    _person_id: Uuid,
     subject_type: String,
     email: String,
     display_name: String,
@@ -162,7 +165,11 @@ struct SessionRow {
     ip: Option<String>,
     created_at: DateTime<Utc>,
     expires_at: DateTime<Utc>,
-    token: String,
+}
+
+struct CreatedSession {
+    row: SessionRow,
+    token_plaintext: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -231,23 +238,35 @@ struct RevokeSessionRequest {
 enum AuthResponse {
     Authenticated {
         token: String,
-        subject: SubjectProfile,
         session: SessionInfo,
+        subject_id: Uuid,
+        subject_type: String,
     },
     MfaRequired {
         ticket_id: Uuid,
         otp_hint: String,
-        demo_otp: String,
     },
 }
 
 #[derive(Debug, Serialize)]
 struct SubjectProfile {
     id: Uuid,
+    person_id: Uuid,
     subject_type: String,
     email: String,
     display_name: String,
     mfa_enabled: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct LinkedSubject {
+    id: Uuid,
+    person_id: Uuid,
+    subject_type: String,
+    email: String,
+    display_name: String,
+    mfa_enabled: bool,
+    is_current: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -265,7 +284,6 @@ struct SessionInfo {
 #[derive(Debug, Serialize)]
 struct OtpRequestResponse {
     otp_hint: String,
-    demo_otp: String,
     expires_in_sec: i64,
 }
 
@@ -283,8 +301,12 @@ struct LogoutResponse {
 #[derive(Debug)]
 struct AuthContext {
     subject_id: Uuid,
-    token: String,
     session_id: Uuid,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateProfileRequest {
+    display_name: String,
 }
 
 #[tokio::main]
@@ -296,6 +318,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let database_url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://postgres:postgres@localhost:5432/multi_subject_auth".to_string());
+    let session_token_pepper =
+        std::env::var("SESSION_TOKEN_PEPPER").unwrap_or_else(|_| "dev-only-change-me".to_string());
 
     let pool = PgPoolOptions::new()
         .max_connections(10)
@@ -319,6 +343,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app_state = AppState {
         pool,
         session_ttl_hours: 24 * 7,
+        session_token_pepper,
         webauthn: Arc::new(webauthn),
         ceremonies: Arc::new(RwLock::new(HashMap::new())),
     };
@@ -334,6 +359,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/auth/{subject}/passkey/login/finish", post(passkey_login_finish))
         .route("/auth/{subject}/mfa/verify", post(verify_mfa))
         .route("/me/profile", get(me_profile))
+        .route("/me/profile", post(update_profile))
+        .route("/me/linked-subjects", get(me_linked_subjects))
         .route("/me/sessions", get(list_sessions))
         .route("/me/sessions/revoke", post(revoke_session))
         .route("/auth/logout", post(logout))
@@ -375,29 +402,68 @@ async fn seed_data(pool: &PgPool) -> Result<(), AppError> {
     ];
 
     for (kind, email, display_name, password, mfa_enabled) in users {
+        let normalized_email = email.trim().to_lowercase();
+        let person_id = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            INSERT INTO persons (id, primary_email)
+            VALUES ($1, $2)
+            ON CONFLICT (primary_email) DO NOTHING
+            "#,
+        )
+        .bind(person_id)
+        .bind(&normalized_email)
+        .execute(pool)
+        .await?;
+
+        let person: (Uuid,) =
+            sqlx::query_as("SELECT id FROM persons WHERE primary_email = $1")
+                .bind(&normalized_email)
+                .fetch_one(pool)
+                .await?;
+
         let id = Uuid::new_v4();
         sqlx::query(
             r#"
-            INSERT INTO subjects (id, subject_type, email, display_name, mfa_enabled)
-            VALUES ($1, $2, $3, $4, $5)
+            INSERT INTO subjects (id, person_id, subject_type, email, display_name, mfa_enabled)
+            VALUES ($1, $2, $3, $4, $5, $6)
             ON CONFLICT (subject_type, email)
-            DO UPDATE SET display_name = EXCLUDED.display_name, mfa_enabled = EXCLUDED.mfa_enabled
+            DO UPDATE SET person_id = EXCLUDED.person_id, display_name = EXCLUDED.display_name, mfa_enabled = EXCLUDED.mfa_enabled
             "#,
         )
         .bind(id)
+        .bind(person.0)
         .bind(kind.as_db_str())
-        .bind(email)
+        .bind(&normalized_email)
         .bind(display_name)
         .bind(mfa_enabled)
         .execute(pool)
         .await?;
 
         let subject: SubjectRow = sqlx::query_as(
-            r#"SELECT id, subject_type, email, display_name, mfa_enabled FROM subjects WHERE subject_type = $1 AND email = $2"#,
+            r#"
+            SELECT s.id, s.person_id AS _person_id, s.subject_type, s.email, COALESCE(sp.display_name, s.display_name) AS display_name, s.mfa_enabled
+            FROM subjects s
+            LEFT JOIN subject_profiles sp ON sp.subject_id = s.id
+            WHERE s.subject_type = $1 AND s.email = $2
+            "#,
         )
         .bind(kind.as_db_str())
-        .bind(email)
+        .bind(&normalized_email)
         .fetch_one(pool)
+        .await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO subject_profiles(subject_id, display_name)
+            VALUES ($1, $2)
+            ON CONFLICT (subject_id)
+            DO UPDATE SET display_name = EXCLUDED.display_name, updated_at = NOW()
+            "#,
+        )
+        .bind(subject.id)
+        .bind(display_name)
+        .execute(pool)
         .await?;
 
         let hash = hash_secret(password)?;
@@ -448,10 +514,10 @@ async fn password_login(
     if subject.mfa_enabled {
         let ticket = create_mfa_ticket(&state.pool, subject.id, "password").await?;
         let (otp, _) = create_otp_code(&state.pool, subject.id, "mfa").await?;
+        info!("mfa otp generated for subject {} ({}) code={}", subject.id, subject.subject_type, otp);
         return Ok(Json(AuthResponse::MfaRequired {
             ticket_id: ticket,
-            otp_hint: "Check authenticator OTP (demo returns code here).".to_string(),
-            demo_otp: otp,
+            otp_hint: "Check your authenticator channel for OTP.".to_string(),
         }));
     }
 
@@ -472,9 +538,10 @@ async fn password_login(
     .await?;
 
     Ok(Json(AuthResponse::Authenticated {
-        token: session.token.clone(),
-        subject: to_subject_profile(subject),
-        session: to_session_info(session, true),
+        token: session.token_plaintext.clone(),
+        session: to_session_info(session.row, true),
+        subject_id: subject.id,
+        subject_type: subject.subject_type,
     }))
 }
 
@@ -487,11 +554,11 @@ async fn request_otp(
     let subject = load_subject_by_email(&state.pool, &subject_kind, &payload.email).await?;
 
     let (otp, expires_at) = create_otp_code(&state.pool, subject.id, "login").await?;
+    info!("login otp generated for subject {} ({}) code={}", subject.id, subject.subject_type, otp);
     let ttl = (expires_at - Utc::now()).num_seconds().max(0);
 
     Ok(Json(OtpRequestResponse {
-        otp_hint: "Use the code within 5 minutes.".to_string(),
-        demo_otp: otp,
+        otp_hint: "Use the code within 5 minutes (delivered through your OTP channel).".to_string(),
         expires_in_sec: ttl,
     }))
 }
@@ -517,9 +584,10 @@ async fn verify_otp(
         create_session(&state, &subject, "otp", &device_name, &device_fingerprint, &headers).await?;
 
     Ok(Json(AuthResponse::Authenticated {
-        token: session.token.clone(),
-        subject: to_subject_profile(subject),
-        session: to_session_info(session, true),
+        token: session.token_plaintext.clone(),
+        session: to_session_info(session.row, true),
+        subject_id: subject.id,
+        subject_type: subject.subject_type,
     }))
 }
 
@@ -718,10 +786,10 @@ async fn passkey_login_finish(
     if subject.mfa_enabled {
         let ticket = create_mfa_ticket(&state.pool, subject.id, "passkey").await?;
         let (otp, _) = create_otp_code(&state.pool, subject.id, "mfa").await?;
+        info!("mfa otp generated for subject {} ({}) code={}", subject.id, subject.subject_type, otp);
         return Ok(Json(AuthResponse::MfaRequired {
             ticket_id: ticket,
             otp_hint: "MFA enabled; enter OTP to finish sign-in.".to_string(),
-            demo_otp: otp,
         }));
     }
 
@@ -742,9 +810,10 @@ async fn passkey_login_finish(
     .await?;
 
     Ok(Json(AuthResponse::Authenticated {
-        token: session.token.clone(),
-        subject: to_subject_profile(subject),
-        session: to_session_info(session, true),
+        token: session.token_plaintext.clone(),
+        session: to_session_info(session.row, true),
+        subject_id: subject.id,
+        subject_type: subject.subject_type,
     }))
 }
 
@@ -798,9 +867,10 @@ async fn verify_mfa(
     .await?;
 
     Ok(Json(AuthResponse::Authenticated {
-        token: session.token.clone(),
-        subject: to_subject_profile(subject),
-        session: to_session_info(session, true),
+        token: session.token_plaintext.clone(),
+        session: to_session_info(session.row, true),
+        subject_id: subject.id,
+        subject_type: subject.subject_type,
     }))
 }
 
@@ -808,19 +878,70 @@ async fn me_profile(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<SubjectProfile>, AppError> {
-    let auth = parse_auth(&state.pool, &headers).await?;
+    let auth = parse_auth(&state, &headers).await?;
     let subject = load_subject_by_id(&state.pool, auth.subject_id).await?;
     Ok(Json(to_subject_profile(subject)))
+}
+
+async fn update_profile(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<UpdateProfileRequest>,
+) -> Result<Json<SubjectProfile>, AppError> {
+    let auth = parse_auth(&state, &headers).await?;
+    let next_name = payload.display_name.trim();
+    if next_name.is_empty() {
+        return Err(AppError::bad_request("display_name cannot be empty"));
+    }
+
+    sqlx::query(
+        r#"
+        INSERT INTO subject_profiles(subject_id, display_name)
+        VALUES ($1, $2)
+        ON CONFLICT (subject_id)
+        DO UPDATE SET display_name = EXCLUDED.display_name, updated_at = NOW()
+        "#,
+    )
+    .bind(auth.subject_id)
+    .bind(next_name)
+    .execute(&state.pool)
+    .await?;
+
+    let subject = load_subject_by_id(&state.pool, auth.subject_id).await?;
+    Ok(Json(to_subject_profile(subject)))
+}
+
+async fn me_linked_subjects(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<LinkedSubject>>, AppError> {
+    let auth = parse_auth(&state, &headers).await?;
+    let current = load_subject_by_id(&state.pool, auth.subject_id).await?;
+    let rows = load_subjects_by_person_id(&state.pool, current._person_id).await?;
+
+    let linked = rows
+        .into_iter()
+        .map(|row| LinkedSubject {
+            id: row.id,
+            person_id: row._person_id,
+            subject_type: row.subject_type,
+            email: row.email,
+            display_name: row.display_name,
+            mfa_enabled: row.mfa_enabled,
+            is_current: row.id == auth.subject_id,
+        })
+        .collect();
+    Ok(Json(linked))
 }
 
 async fn list_sessions(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<SessionInfo>>, AppError> {
-    let auth = parse_auth(&state.pool, &headers).await?;
+    let auth = parse_auth(&state, &headers).await?;
     let rows: Vec<SessionRow> = sqlx::query_as(
         r#"
-        SELECT id, auth_method, device_name, user_agent, ip, created_at, expires_at, token
+        SELECT id, auth_method, device_name, user_agent, ip, created_at, expires_at
         FROM sessions
         WHERE subject_id = $1 AND revoked_at IS NULL AND expires_at > NOW()
         ORDER BY created_at DESC
@@ -833,7 +954,7 @@ async fn list_sessions(
     let sessions = rows
         .into_iter()
         .map(|r| {
-            let is_current = r.token == auth.token;
+            let is_current = r.id == auth.session_id;
             to_session_info(r, is_current)
         })
         .collect();
@@ -846,7 +967,7 @@ async fn revoke_session(
     headers: HeaderMap,
     Json(payload): Json<RevokeSessionRequest>,
 ) -> Result<Json<LogoutResponse>, AppError> {
-    let auth = parse_auth(&state.pool, &headers).await?;
+    let auth = parse_auth(&state, &headers).await?;
 
     let result = sqlx::query(
         "UPDATE sessions SET revoked_at = NOW() WHERE id = $1 AND subject_id = $2 AND revoked_at IS NULL",
@@ -865,7 +986,7 @@ async fn logout(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<LogoutResponse>, AppError> {
-    let auth = parse_auth(&state.pool, &headers).await?;
+    let auth = parse_auth(&state, &headers).await?;
 
     let result = sqlx::query("UPDATE sessions SET revoked_at = NOW() WHERE id = $1 AND revoked_at IS NULL")
         .bind(auth.session_id)
@@ -877,7 +998,7 @@ async fn logout(
     }))
 }
 
-async fn parse_auth(pool: &PgPool, headers: &HeaderMap) -> Result<AuthContext, AppError> {
+async fn parse_auth(state: &AppState, headers: &HeaderMap) -> Result<AuthContext, AppError> {
     let auth_header = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -889,21 +1010,21 @@ async fn parse_auth(pool: &PgPool, headers: &HeaderMap) -> Result<AuthContext, A
         .trim()
         .to_string();
 
+    let token_hash = hash_session_token(&token, &state.session_token_pepper);
     let row: (Uuid, Uuid) = sqlx::query_as(
         r#"
         SELECT subject_id, id
         FROM sessions
-        WHERE token = $1 AND revoked_at IS NULL AND expires_at > NOW()
+        WHERE token_hash = $1 AND revoked_at IS NULL AND expires_at > NOW()
         "#,
     )
-    .bind(&token)
-    .fetch_optional(pool)
+    .bind(&token_hash)
+    .fetch_optional(&state.pool)
     .await?
     .ok_or_else(|| AppError::unauthorized("session expired or invalid"))?;
 
     Ok(AuthContext {
         subject_id: row.0,
-        token,
         session_id: row.1,
     })
 }
@@ -916,9 +1037,10 @@ async fn load_subject_by_email(
     let normalized = email.trim().to_lowercase();
     let row: SubjectRow = sqlx::query_as(
         r#"
-        SELECT id, subject_type, email, display_name, mfa_enabled
-        FROM subjects
-        WHERE subject_type = $1 AND email = $2
+        SELECT s.id, s.person_id AS _person_id, s.subject_type, s.email, COALESCE(sp.display_name, s.display_name) AS display_name, s.mfa_enabled
+        FROM subjects s
+        LEFT JOIN subject_profiles sp ON sp.subject_id = s.id
+        WHERE s.subject_type = $1 AND s.email = $2
         "#,
     )
     .bind(subject_kind.as_db_str())
@@ -931,12 +1053,33 @@ async fn load_subject_by_email(
 
 async fn load_subject_by_id(pool: &PgPool, id: Uuid) -> Result<SubjectRow, AppError> {
     sqlx::query_as(
-        "SELECT id, subject_type, email, display_name, mfa_enabled FROM subjects WHERE id = $1",
+        r#"
+        SELECT s.id, s.person_id AS _person_id, s.subject_type, s.email, COALESCE(sp.display_name, s.display_name) AS display_name, s.mfa_enabled
+        FROM subjects s
+        LEFT JOIN subject_profiles sp ON sp.subject_id = s.id
+        WHERE s.id = $1
+        "#,
     )
     .bind(id)
     .fetch_optional(pool)
     .await?
     .ok_or_else(|| AppError::not_found("subject not found"))
+}
+
+async fn load_subjects_by_person_id(pool: &PgPool, person_id: Uuid) -> Result<Vec<SubjectRow>, AppError> {
+    let rows: Vec<SubjectRow> = sqlx::query_as(
+        r#"
+        SELECT s.id, s.person_id AS _person_id, s.subject_type, s.email, COALESCE(sp.display_name, s.display_name) AS display_name, s.mfa_enabled
+        FROM subjects s
+        LEFT JOIN subject_profiles sp ON sp.subject_id = s.id
+        WHERE s.person_id = $1
+        ORDER BY s.subject_type
+        "#,
+    )
+    .bind(person_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
 }
 
 async fn create_otp_code(
@@ -1025,8 +1168,9 @@ async fn create_session(
     device_name: &str,
     device_fingerprint: &str,
     headers: &HeaderMap,
-) -> Result<SessionRow, AppError> {
-    let token = random_token(64);
+) -> Result<CreatedSession, AppError> {
+    let token_plaintext = random_token(64);
+    let token_hash = hash_session_token(&token_plaintext, &state.session_token_pepper);
     let expires_at = Utc::now() + Duration::hours(state.session_ttl_hours);
 
     let user_agent = headers
@@ -1060,8 +1204,8 @@ async fn create_session(
     sqlx::query(
         r#"
         INSERT INTO sessions(
-            id, subject_id, subject_type, auth_method, device_name, device_fingerprint, user_agent, ip, token, expires_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            id, subject_id, subject_type, auth_method, device_name, device_fingerprint, user_agent, ip, token_hash, token, expires_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NULL, $10)
         "#,
     )
     .bind(id)
@@ -1072,19 +1216,22 @@ async fn create_session(
     .bind(device_fingerprint)
     .bind(user_agent)
     .bind(ip)
-    .bind(&token)
+    .bind(&token_hash)
     .bind(expires_at)
     .execute(&state.pool)
     .await?;
 
     let row: SessionRow = sqlx::query_as(
-        "SELECT id, auth_method, device_name, user_agent, ip, created_at, expires_at, token FROM sessions WHERE id = $1",
+        "SELECT id, auth_method, device_name, user_agent, ip, created_at, expires_at FROM sessions WHERE id = $1",
     )
     .bind(id)
     .fetch_one(&state.pool)
     .await?;
 
-    Ok(row)
+    Ok(CreatedSession {
+        row,
+        token_plaintext,
+    })
 }
 
 fn to_session_info(row: SessionRow, is_current: bool) -> SessionInfo {
@@ -1103,6 +1250,7 @@ fn to_session_info(row: SessionRow, is_current: bool) -> SessionInfo {
 fn to_subject_profile(row: SubjectRow) -> SubjectProfile {
     SubjectProfile {
         id: row.id,
+        person_id: row._person_id,
         subject_type: row.subject_type,
         email: row.email,
         display_name: row.display_name,
@@ -1116,6 +1264,14 @@ fn random_token(len: usize) -> String {
         .take(len)
         .map(char::from)
         .collect()
+}
+
+fn hash_session_token(token: &str, pepper: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(pepper.as_bytes());
+    hasher.update(token.as_bytes());
+    let result = hasher.finalize();
+    format!("{:x}", result)
 }
 
 fn resolve_device_fingerprint(

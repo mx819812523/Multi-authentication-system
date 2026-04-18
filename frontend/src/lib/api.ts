@@ -2,10 +2,21 @@ export type SubjectType = 'member' | 'community_staff' | 'platform_staff'
 
 export type SubjectProfile = {
   id: string
+  person_id: string
   subject_type: SubjectType
   email: string
   display_name: string
   mfa_enabled: boolean
+}
+
+export type LinkedSubject = {
+  id: string
+  person_id: string
+  subject_type: SubjectType
+  email: string
+  display_name: string
+  mfa_enabled: boolean
+  is_current: boolean
 }
 
 export type SessionInfo = {
@@ -23,14 +34,14 @@ export type AuthResponse =
   | {
       status: 'authenticated'
       token: string
-      subject: SubjectProfile
       session: SessionInfo
+      subject_id: string
+      subject_type: SubjectType
     }
   | {
       status: 'mfa_required'
       ticket_id: string
       otp_hint: string
-      demo_otp: string
     }
 
 export type PasskeyCeremonyResponse = {
@@ -75,7 +86,7 @@ export const api = {
     })
   },
   otpRequest(subject: SubjectType, payload: { email: string }) {
-    return request<{ otp_hint: string; demo_otp: string; expires_in_sec: number }>(`/auth/${subject}/otp/request`, {
+    return request<{ otp_hint: string; expires_in_sec: number }>(`/auth/${subject}/otp/request`, {
       method: 'POST',
       body: JSON.stringify(payload)
     })
@@ -134,6 +145,18 @@ export const api = {
   profile(token: string) {
     return request<SubjectProfile>(`/me/profile`, {
       headers: { Authorization: `Bearer ${token}` }
+    })
+  },
+  linkedSubjects(token: string) {
+    return request<LinkedSubject[]>(`/me/linked-subjects`, {
+      headers: { Authorization: `Bearer ${token}` }
+    })
+  },
+  updateProfile(token: string, display_name: string) {
+    return request<SubjectProfile>(`/me/profile`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ display_name })
     })
   },
   sessions(token: string) {

@@ -79,6 +79,10 @@ h1 {
   padding: 1.2rem;
 }
 
+.linked-lane {
+  grid-column: 1 / -1;
+}
+
 .subject-switch {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
@@ -260,6 +264,48 @@ button:disabled {
   margin-top: 0.9rem;
   display: grid;
   gap: 0.55rem;
+}
+
+.linked-subjects {
+  margin-top: 0.9rem;
+  padding: 0.7rem 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.linked-subjects h3 {
+  margin: 0 0 0.45rem;
+  font-family: 'Space Grotesk', sans-serif;
+  font-size: 0.95rem;
+}
+
+.linked-table-wrap {
+  overflow-x: auto;
+  border: 1px solid var(--line);
+  background: rgba(8, 12, 21, 0.7);
+}
+
+.linked-table {
+  width: 100%;
+  border-collapse: collapse;
+  min-width: 640px;
+}
+
+.linked-table th,
+.linked-table td {
+  text-align: left;
+  padding: 0.55rem 0.65rem;
+  border-bottom: 1px solid rgba(141, 160, 198, 0.18);
+  font-size: 0.84rem;
+}
+
+.linked-table th {
+  font-family: 'Space Grotesk', sans-serif;
+  letter-spacing: 0.03em;
+  color: var(--muted);
+}
+
+.linked-table tbody tr:hover {
+  background: rgba(102, 255, 168, 0.08);
 }
 
 .session-item {
